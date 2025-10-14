@@ -1,4 +1,7 @@
 #include "tcp_connect.h"
+#include "log_handler.h"
+#include "usb_handler.h"
+#include "esp_system.h"
 // #include <errno.h>
 
 #define TAG "TCP_CONNECT"
@@ -12,43 +15,87 @@ static submit recv_submit;
 
 esp_err_t tcp_server_init(void)
 {
+    log_write("[TCP] Initializing NVS flash...");
     ESP_ERROR_CHECK(nvs_flash_init());
+    
+    log_write("[TCP] Initializing network interface...");
     ESP_ERROR_CHECK(esp_netif_init());
+    
+    log_write("[TCP] Creating event loop...");
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    
+    log_write("[TCP] Connecting to network...");
     ESP_ERROR_CHECK(example_connect());
-
+    
+    log_write("[TCP] Network initialization complete");
     return ESP_OK;
 }
 
 static void do_recv()
 {
+    log_write("[TCP] *** do_recv() task started ***");
+    
     int len;
     usbip_header_common dev_recv;
+    log_write("[TCP] Variables allocated, sock=%d", sock);
+    log_write("[TCP] Starting receive task, waiting for USB/IP commands...");
+    
     while (1)
     {
         if (!device_busy)
         {
             // usbip_header_common dev_recv;
-            len = recv(sock, &dev_recv, sizeof(usbip_header_common), MSG_DONTWAIT);
+            len = recv(sock, &dev_recv, sizeof(usbip_header_common), 0); // Blocking call
             if (len < 0)
             {
                 ESP_LOGE(TAG, "Error occurred during receiving: errno %d", errno);
+                log_write("[TCP] ERROR: recv failed, errno %d", errno);
+                break;
             }
             else if (len == 0)
             {
                 ESP_LOGW(TAG, "Connection closed");
+                log_write("[TCP] Connection closed by client - DETACH REQUEST DETECTED!");
+                log_write("[TCP] REBOOTING ESP32 NOW...");
+                vTaskDelay(pdMS_TO_TICKS(100)); // Brief delay for log flush
+                esp_restart(); // Force immediate reboot
             }
-            else if (ntohs(dev_recv.usbip_version) == USBIP_VERSION)
+            else if (len > 0)
             {
-                tcp_data buffer;
-                buffer.sock = sock;
-                buffer.len = sizeof(usbip_header_common);
-                buffer.rx_buffer = (uint8_t *)&dev_recv;
-                esp_event_post_to(loop_handle, USBIP_EVENT_BASE, ntohs(dev_recv.command_code), (void *)&buffer, sizeof(tcp_data), 10);
+                log_write("[TCP] Received %d bytes, version=0x%04x, command=0x%04x", 
+                         len, ntohs(dev_recv.usbip_version), ntohs(dev_recv.command_code));
+                
+                if (ntohs(dev_recv.usbip_version) == USBIP_VERSION)
+                {
+                    log_write("[TCP] Valid USB/IP command received: 0x%04x", ntohs(dev_recv.command_code));
+                    
+                    if (loop_handle == NULL) {
+                        log_write("[TCP] ERROR: Event loop not initialized!");
+                        ESP_LOGE(TAG, "Event loop handle is NULL!");
+                        break;
+                    }
+                    
+                    tcp_data buffer;
+                    buffer.sock = sock;
+                    buffer.len = sizeof(usbip_header_common);
+                    buffer.rx_buffer = (uint8_t *)&dev_recv;
+                    
+                    esp_err_t err = esp_event_post_to(loop_handle, USBIP_EVENT_BASE, ntohs(dev_recv.command_code), 
+                                                       (void *)&buffer, sizeof(tcp_data), portMAX_DELAY);
+                    if (err != ESP_OK) {
+                        log_write("[TCP] ERROR: Failed to post event: %s", esp_err_to_name(err));
+                    }
+                }
+                else
+                {
+                    log_write("[TCP] ERROR: Invalid USB/IP version: 0x%04x (expected 0x%04x)", 
+                             ntohs(dev_recv.usbip_version), USBIP_VERSION);
+                }
             }
         }
         if (device_busy)
         {
+            log_write("[TCP] Device busy mode - handling URB commands");
             /* TODO : Start dealing with URB command codes */
             usbip_header_basic header;
             len = 0;
@@ -56,22 +103,42 @@ static void do_recv()
             {
                 len = recv(sock, &header, sizeof(usbip_header_basic), 0);
 
-                if (len > 0)
+                if (len < 0) {
+                    log_write("[TCP] ERROR: recv failed in URB loop, errno %d", errno);
+                    break;
+                } else if (len == 0) {
+                    log_write("[TCP] Connection closed in URB loop - DETACH REQUEST DETECTED!");
+                    log_write("[TCP] REBOOTING ESP32 NOW...");
+                    vTaskDelay(pdMS_TO_TICKS(100)); // Brief delay for log flush
+                    esp_restart(); // Force immediate reboot
+                } else if (len > 0)
                 {
-                    switch (ntohl(header.command))
+                    uint32_t cmd = ntohl(header.command);
+                    log_write("[TCP] Received URB command: 0x%08x, seqnum=%u", cmd, ntohl(header.seqnum));
+                    
+                    switch (cmd)
                     {
                     case USBIP_CMD_SUBMIT:
                     {
+                        log_write("[TCP] USBIP_CMD_SUBMIT received");
                         /* TODO: REPLY with USBIP_RET_SUBMIT */
                         usbip_cmd_submit cmd_submit;
                         len += recv(sock, &cmd_submit, sizeof(usbip_cmd_submit) - 1024, MSG_DONTWAIT);
-                        if (ntohl(header.direction) == 0)
-                            len += recv(sock, &cmd_submit.transfer_buffer[0], ntohl(cmd_submit.transfer_buffer_length), MSG_DONTWAIT); // get_usbip_ret_submit(&cmd_submit, &header, sock);
+                        if (ntohl(header.direction) == 0) {
+                            log_write("[TCP] Host-to-device transfer, length=%u", ntohl(cmd_submit.transfer_buffer_length));
+                            len += recv(sock, &cmd_submit.transfer_buffer[0], ntohl(cmd_submit.transfer_buffer_length), MSG_DONTWAIT);
+                        } else {
+                            log_write("[TCP] Device-to-host transfer, length=%u", ntohl(cmd_submit.transfer_buffer_length));
+                        }
                         recv_submit.header = header;
                         recv_submit.cmd_submit = cmd_submit;
                         recv_submit.sock = sock;
-                        if (len > 20)
-                            esp_event_post_to(loop_handle2, USBIP_EVENT_BASE, USBIP_CMD_SUBMIT, (void *)&recv_submit, sizeof(submit), 10);
+                        if (len > 20) {
+                            esp_err_t err = esp_event_post_to(loop_handle2, USBIP_EVENT_BASE, USBIP_CMD_SUBMIT, (void *)&recv_submit, sizeof(submit), 10);
+                            if (err != ESP_OK) {
+                                log_write("[TCP] ERROR: Failed to post SUBMIT event: %s", esp_err_to_name(err));
+                            }
+                        }
                         len = 0;
                         break;
                     }
@@ -109,12 +176,26 @@ static void do_recv()
         if (!device_busy)
             break;
     }
+    
+    log_write("[TCP] Receive task ending (should not reach here - detach triggers immediate reboot)");
+    
+    // Mark device as not busy so no more transfers are accepted
+    device_busy = false;
+    
+    // Reset pending transfer flags (declared in usb_handler.h)
+    ep1_transfer_pending = false;
+    ep2_transfer_pending = false;
+    
+    close(sock);
+    sock = -1;  // Invalidate socket
+    
     vTaskDelete(NULL);
 }
 
 void tcp_server_start(void *pvParameters)
 {
-    char addr_str[128];
+    ESP_LOGI(TAG, "TCP server task started");
+    
     int addr_family = AF_INET;
     int ip_protocol = 0;
     int keepAlive = 1;
@@ -133,6 +214,7 @@ void tcp_server_start(void *pvParameters)
     if (listen_sock < 0)
     {
         ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+        log_write("[TCP] ERROR: Failed to create socket, errno %d", errno);
         vTaskDelete(NULL);
         return;
     }
@@ -141,49 +223,94 @@ void tcp_server_start(void *pvParameters)
     setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     ESP_LOGI(TAG, "Socket created");
+    log_write("[TCP] Socket created successfully");
 
     int err = bind(listen_sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
     if (err != 0)
     {
         ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
         ESP_LOGE(TAG, "IPPROTO: %d", addr_family);
+        log_write("[TCP] ERROR: Failed to bind to port %d, errno %d", PORT, errno);
         goto CLEAN_UP;
     }
     ESP_LOGI(TAG, "Socket bound, port %d", PORT);
+    log_write("[TCP] Socket bound to port %d", PORT);
 
     err = listen(listen_sock, 1);
     if (err != 0)
     {
         ESP_LOGE(TAG, "Error occurred during listen: errno %d", errno);
+        log_write("[TCP] ERROR: Failed to listen on port %d, errno %d", PORT, errno);
         goto CLEAN_UP;
     }
+    log_write("[TCP] TCP server listening on port %d for USB/IP connections", PORT);
+    
     while (1)
     {
-
         ESP_LOGI(TAG, "Socket listening");
+        log_write("[TCP] Waiting for client connection...");
+        vTaskDelay(pdMS_TO_TICKS(5000)); // 5 second delay between log messages
 
-        struct sockaddr_storage source_addr; // Large enough for both IPv4 or IPv6
+        struct sockaddr_storage source_addr;
         socklen_t addr_len = sizeof(source_addr);
+        
+        ESP_LOGI(TAG, "About to call accept()...");
         sock = accept(listen_sock, (struct sockaddr *)&source_addr, &addr_len);
+        
+        ESP_LOGI(TAG, "Accept returned: sock=%d, errno=%d", sock, errno);
+        
         if (sock < 0)
         {
-            ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
-            break;
+            ESP_LOGE(TAG, "Accept failed: errno %d", errno);
+            log_write("[TCP] ERROR: accept() failed, errno %d", errno);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
         }
 
-        // Set tcp keepalive option
-        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(int));
-        setsockopt(sock, IPPROTO_TCP, 4, &keepIdle, sizeof(int));
-        setsockopt(sock, IPPROTO_TCP, 5, &keepInterval, sizeof(int));
-        setsockopt(sock, IPPROTO_TCP, 6, &keepCount, sizeof(int));
-
-        // Convert ipv4 address to string
+        // Successfully accepted connection
+        ESP_LOGI(TAG, "Connection accepted, sock=%d", sock);
+        log_write("[TCP] Client connected successfully");
+        
+        // Get client address
+        char client_ip[32] = "unknown";
         if (source_addr.ss_family == PF_INET)
         {
-            inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
+            struct sockaddr_in *addr_in = (struct sockaddr_in *)&source_addr;
+            inet_ntop(AF_INET, &addr_in->sin_addr, client_ip, sizeof(client_ip));
         }
+        
+        log_write("[TCP] Client IP: %s", client_ip);
+        
+        log_write("[TCP] Setting socket keepalive options...");
+        // Set tcp keepalive options
+        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(int));
+        log_write("[TCP] SO_KEEPALIVE set");
+        
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(int));
+        log_write("[TCP] TCP_KEEPIDLE set");
+        
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepInterval, sizeof(int));
+        log_write("[TCP] TCP_KEEPINTVL set");
+        
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(int));
+        log_write("[TCP] TCP_KEEPCNT set");
 
-        xTaskCreatePinnedToCore(do_recv, "tcp_recv", 2 * 4096, NULL, tskIDLE_PRIORITY, NULL, 1);
+        log_write("[TCP] Creating receive task...");
+        log_write("[TCP] Free heap before task creation: %d bytes", esp_get_free_heap_size());
+        ESP_LOGI(TAG, "Creating receive task...");
+        
+        // Create receive task - try unpinned with smaller stack
+        BaseType_t ret = xTaskCreate(do_recv, "tcp_recv", 6144, NULL, 10, NULL);
+        log_write("[TCP] xTaskCreate returned: %d", ret);
+        if (ret != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create receive task");
+            log_write("[TCP] ERROR: Failed to create receive task");
+            close(sock);
+            continue;
+        }
+        
+        log_write("[TCP] Receive task created successfully");
+        ESP_LOGI(TAG, "Receive task created successfully");
 
         // shutdown(sock, 0);
         // close(sock);

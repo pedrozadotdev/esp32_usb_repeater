@@ -1,8 +1,30 @@
-set(srcs "src/main.c" "src/usbip_server.c" "src/usb_handler.c" "src/tcp_connect.c")
-set(include_dirs include)
+# List of source files - always included
+set(SRCS "src/main.c"
+         "src/usbip_server.c"
+         "src/usb_handler.c"
+         "src/tcp_connect.c")
 
+# Conditionally add log handler
+if(CONFIG_ENABLE_LOG_HANDLER)
+    list(APPEND SRCS "src/log_handler.c")
+endif()
 
-idf_component_register(SRCS "${srcs}"
-                       INCLUDE_DIRS "${include_dirs}"
-                       REQUIRES lwip usb nvs_flash driver efuse esp_wifi esp_adc esp_common esp_event 
-                                esp_rom freertos heap log soc spiffs protocol_examples_common)
+# Conditionally add HTTP server
+if(CONFIG_ENABLE_HTTP_SERVER)
+    list(APPEND SRCS "src/http_server.c")
+endif()
+
+# List of include directories
+set(INCLUDE_DIRS "include")
+
+# Build list of required components
+set(REQUIRED_COMPONENTS usb)
+if(CONFIG_ENABLE_HTTP_SERVER)
+    list(APPEND REQUIRED_COMPONENTS esp_http_server)
+endif()
+
+# Register the component and list all its private dependencies
+idf_component_register(SRCS ${SRCS}
+                       INCLUDE_DIRS ${INCLUDE_DIRS}
+                       REQUIRES ${REQUIRED_COMPONENTS}
+                       PRIV_REQUIRES esp_wifi lwip nvs_flash esp_event protocol_examples_common)

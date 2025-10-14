@@ -1,0 +1,72 @@
+menu "USB Repeater Configuration"
+
+    config ENABLE_LOG_HANDLER
+        bool "Enable Log Handler"
+        default y
+        help
+            Enable the log handler feature which stores logs in memory.
+            When enabled, logs will be stored in RTC memory and can be accessed
+            via the HTTP server or through log_write() function.
+            
+            If disabled, log_write() calls will be no-ops and log-related
+            functionality will be compiled out.
+
+    config ENABLE_HTTP_SERVER
+        bool "Enable HTTP Log Server"
+        default y
+        depends on ENABLE_LOG_HANDLER
+        help
+            Enable the HTTP server on port 8080 for accessing logs remotely.
+            
+            The HTTP server provides endpoints for:
+            - GET /logs - View all logs
+            - GET /clear - Clear logs
+            - GET / - Redirect to /logs
+            
+            Note: This option requires ENABLE_LOG_HANDLER to be enabled.
+            If disabled, the HTTP server will not be compiled or started.
+
+    menu "WiFi Configuration"
+
+        config USB_REPEATER_WIFI_SSID
+            string "WiFi SSID"
+            default "myssid"
+            help
+                SSID (network name) for the device to connect to.
+                This is the WiFi network name that the ESP32 will attempt to connect to.
+                
+                Maximum length: 32 characters
+
+        config USB_REPEATER_WIFI_PASSWORD
+            string "WiFi Password"
+            default "mypassword"
+            help
+                WiFi password (WPA or WPA2) for the network.
+                
+                Leave empty for open networks (no password).
+                Maximum length: 64 characters
+
+        config USB_REPEATER_WIFI_MAX_RETRY
+            int "Maximum WiFi Connection Retry"
+            default 6
+            range 1 255
+            help
+                Maximum number of times to retry WiFi connection before giving up.
+                After this many failed attempts, the device will stop trying to connect.
+
+        # Override the example component's WiFi configuration with our values
+        config EXAMPLE_WIFI_SSID
+            string
+            default USB_REPEATER_WIFI_SSID
+
+        config EXAMPLE_WIFI_PASSWORD
+            string
+            default USB_REPEATER_WIFI_PASSWORD
+
+        config EXAMPLE_WIFI_CONN_MAX_RETRY
+            int
+            default USB_REPEATER_WIFI_MAX_RETRY
+
+    endmenu
+
+endmenu

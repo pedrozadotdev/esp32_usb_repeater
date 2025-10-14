@@ -1,4 +1,5 @@
 #include "usb_handler.h"
+#include "log_handler.h"
 
 #define CLIENT_NUM_EVENT_MSG 15
 
@@ -27,6 +28,10 @@ static int skt;
 // Number Of Interfaces
 int num_of_interfaces;
 
+// Track pending interrupt transfers to prevent memory exhaustion
+bool ep1_transfer_pending = false;
+bool ep2_transfer_pending = false;
+
 esp_event_loop_handle_t loop_handle2 = NULL;
 
 usb_device_info_t *get_dev_info()
@@ -54,14 +59,19 @@ static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *
     switch (event_msg->event)
     {
     case USB_HOST_CLIENT_EVENT_NEW_DEV:
+        log_write("[USB] New USB device detected at address %d", event_msg->new_dev.address);
+        ESP_LOGI(TAG, "New device detected at address %d", event_msg->new_dev.address);
         if (driver_obj->dev_addr == 0)
         {
             driver_obj->dev_addr = event_msg->new_dev.address;
             // Open the device next
             driver_obj->actions |= ACTION_OPEN_DEV;
+            log_write("[USB] Setting ACTION_OPEN_DEV flag");
         }
         break;
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
+        log_write("[USB] USB device disconnected");
+        ESP_LOGI(TAG, "Device disconnected");
         if (driver_obj->dev_hdl != NULL)
         {
             // Cancel any other actions and close the device next
@@ -69,7 +79,8 @@ static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *
         }
         break;
     default:
-        // Should never occur
+        log_write("[USB] Unknown USB event: %d", event_msg->event);
+        ESP_LOGE(TAG, "Unknown event: %d", event_msg->event);
         abort();
     }
 }
@@ -77,8 +88,18 @@ static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *
 static void action_open_dev(class_driver_t *driver_obj)
 {
     assert(driver_obj->dev_addr != 0);
+    log_write("[USB] Opening device at address %d", driver_obj->dev_addr);
     ESP_LOGI(TAG, "Opening device at address %d", driver_obj->dev_addr);
-    ESP_ERROR_CHECK(usb_host_device_open(driver_obj->client_hdl, driver_obj->dev_addr, &driver_obj->dev_hdl));
+    
+    esp_err_t err = usb_host_device_open(driver_obj->client_hdl, driver_obj->dev_addr, &driver_obj->dev_hdl);
+    if (err != ESP_OK) {
+        log_write("[USB] ERROR: Failed to open device: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to open device: %s", esp_err_to_name(err));
+        driver_obj->actions &= ~ACTION_OPEN_DEV;
+        return;
+    }
+    
+    log_write("[USB] Device opened successfully, handle=%p", driver_obj->dev_hdl);
     // Get the device's information next
     driver_obj->actions &= ~ACTION_OPEN_DEV;
     driver_obj->actions |= ACTION_GET_DEV_INFO;
@@ -87,9 +108,18 @@ static void action_open_dev(class_driver_t *driver_obj)
 static void action_get_info(class_driver_t *driver_obj)
 {
     assert(driver_obj->dev_hdl != NULL);
+    log_write("[USB] Getting device information");
     ESP_LOGI(TAG, "Getting device information");
-    // usb_device_info_t dev_info;
-    ESP_ERROR_CHECK(usb_host_device_info(driver_obj->dev_hdl, &dev_info));
+    
+    esp_err_t err = usb_host_device_info(driver_obj->dev_hdl, &dev_info);
+    if (err != ESP_OK) {
+        log_write("[USB] ERROR: Failed to get device info: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to get device info: %s", esp_err_to_name(err));
+        driver_obj->actions &= ~ACTION_GET_DEV_INFO;
+        return;
+    }
+    
+    log_write("[USB] Device speed: %s", (dev_info.speed == USB_SPEED_LOW) ? "Low" : "Full");
     ESP_LOGI(TAG, "\t%s speed", (dev_info.speed == USB_SPEED_LOW) ? "Low" : "Full");
     ESP_LOGI(TAG, "\tbConfigurationValue %d", dev_info.bConfigurationValue);
 
@@ -101,9 +131,18 @@ static void action_get_info(class_driver_t *driver_obj)
 static void action_get_dev_desc(class_driver_t *driver_obj)
 {
     assert(driver_obj->dev_hdl != NULL);
+    log_write("[USB] Getting device descriptor");
     ESP_LOGI(TAG, "Getting device descriptor");
-    // const usb_device_desc_t *dev_desc;
-    ESP_ERROR_CHECK(usb_host_get_device_descriptor(driver_obj->dev_hdl, &dev_desc));
+    
+    esp_err_t err = usb_host_get_device_descriptor(driver_obj->dev_hdl, &dev_desc);
+    if (err != ESP_OK) {
+        log_write("[USB] ERROR: Failed to get device descriptor: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to get device descriptor: %s", esp_err_to_name(err));
+        driver_obj->actions &= ~ACTION_GET_DEV_DESC;
+        return;
+    }
+    
+    log_write("[USB] Device descriptor: VID=0x%04x, PID=0x%04x", dev_desc->idVendor, dev_desc->idProduct);
     usb_print_device_descriptor(dev_desc);
     // Get the device's config descriptor next
     driver_obj->actions &= ~ACTION_GET_DEV_DESC;
@@ -113,21 +152,56 @@ static void action_get_dev_desc(class_driver_t *driver_obj)
 static void action_get_config_desc(class_driver_t *driver_obj)
 {
     assert(driver_obj->dev_hdl != NULL);
+    log_write("[USB] Getting config descriptor");
     ESP_LOGI(TAG, "Getting config descriptor");
-    // const usb_config_desc_t *config_desc;
-    ESP_ERROR_CHECK(usb_host_get_active_config_descriptor(driver_obj->dev_hdl, &config_desc));
+    
+    esp_err_t err = usb_host_get_active_config_descriptor(driver_obj->dev_hdl, &config_desc);
+    if (err != ESP_OK) {
+        log_write("[USB] ERROR: Failed to get config descriptor: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to get config descriptor: %s", esp_err_to_name(err));
+        driver_obj->actions &= ~ACTION_GET_CONFIG_DESC;
+        return;
+    }
+    
     num_of_interfaces = config_desc->bNumInterfaces;
+    log_write("[USB] Config descriptor: %d interface(s)", num_of_interfaces);
+    
     const usb_ep_desc_t *ep;
     int offset = 0;
     for (int i = 0; i < num_of_interfaces; i++)
     {
+        log_write("[USB] Claiming interface %d", i);
         int err = usb_host_interface_claim(driver_obj->client_hdl, driver_obj->dev_hdl, i, 0);
+        if (err != ESP_OK) {
+            log_write("[USB] ERROR: Failed to claim interface %d: %s", i, esp_err_to_name(err));
+            continue;
+        }
+        log_write("[USB] Interface %d claimed successfully", i);
+        
+        log_write("[USB] Parsing interface descriptor");
         const usb_intf_desc_t *intf = usb_parse_interface_descriptor(config_desc, i, 0, &offset);
+        if (intf == NULL) {
+            log_write("[USB] ERROR: Failed to parse interface descriptor");
+            continue;
+        }
+        log_write("[USB] Interface parsed, num endpoints: %d", intf->bNumEndpoints);
+        
+        log_write("[USB] Parsing endpoint descriptor");
         ep = usb_parse_endpoint_descriptor_by_index(intf, 0, config_desc->wTotalLength, &offset);
-        mps[i] = ep->wMaxPacketSize;
+        if (ep == NULL) {
+            log_write("[USB] ERROR: Failed to parse endpoint descriptor");
+            mps[i] = 0;
+        } else {
+            mps[i] = ep->wMaxPacketSize;
+            log_write("[USB] Endpoint 0 max packet size: %d", mps[i]);
+        }
         ESP_LOGI("", "interface claim status: %d", err);
     }
-    usb_print_config_descriptor(config_desc, NULL);
+    
+    log_write("[USB] Printing config descriptor...");
+    // usb_print_config_descriptor() can crash with low stack - skip for now
+    // usb_print_config_descriptor(config_desc, NULL);
+    log_write("[USB] Config descriptor processing complete");
 
     // Get the device's string descriptors next
     driver_obj->actions &= ~ACTION_GET_CONFIG_DESC;
@@ -137,23 +211,34 @@ static void action_get_config_desc(class_driver_t *driver_obj)
 static void action_get_str_desc(class_driver_t *driver_obj)
 {
     assert(driver_obj->dev_hdl != NULL);
+    log_write("[USB] Getting string descriptors");
     // usb_device_info_t dev_info;
     // ESP_ERROR_CHECK(usb_host_device_info(driver_obj->dev_hdl, &dev_info));
     if (dev_info.str_desc_manufacturer)
     {
+        log_write("[USB] Getting Manufacturer string");
         ESP_LOGI(TAG, "Getting Manufacturer string descriptor");
     }
     if (dev_info.str_desc_product)
     {
+        log_write("[USB] Getting Product string");
         ESP_LOGI(TAG, "Getting Product string descriptor");
     }
     if (dev_info.str_desc_serial_num)
     {
+        log_write("[USB] Getting Serial Number string");
         ESP_LOGI(TAG, "Getting Serial Number string descriptor");
     }
+    
+    log_write("[USB] Parsing final interface descriptor");
     // Nothing to do until the device disconnects
     int offset;
     interface_desc = usb_parse_interface_descriptor(config_desc, 0, usb_parse_interface_number_of_alternate(config_desc, 0), &offset);
+    
+    log_write("[USB] USB device enumeration complete!");
+    log_write("[USB] Device ready: VID=0x%04x, PID=0x%04x, %d interface(s)", 
+              dev_desc->idVendor, dev_desc->idProduct, num_of_interfaces);
+    
     driver_obj->actions &= ~ACTION_GET_STR_DESC;
 }
 
@@ -169,6 +254,7 @@ static void aciton_close_dev(class_driver_t *driver_obj)
 
 static void transfer_cb_ctrl(usb_transfer_t *transfer)
 {
+    log_write("[USB_CB] Control transfer callback: status=%d, bytes=%d", transfer->status, transfer->actual_num_bytes);
     ESP_LOGI(TAG, "--------------------------");
     ESP_LOGI(TAG, "Transfer status %d, actual number of bytes transferred %d\n", transfer->status, transfer->actual_num_bytes);
     usbip_ret_submit *ret = (usbip_ret_submit *)transfer->context;
@@ -176,28 +262,66 @@ static void transfer_cb_ctrl(usb_transfer_t *transfer)
     memcpy(&ret->transfer_buffer[0], transfer->data_buffer + 8, transfer->actual_num_bytes - 8);
 
     int len = 0;
-    if (ret->base.direction == 0)
+    
+    // Check if socket is still valid before sending
+    if (skt < 0) {
+        log_write("[USB_CB] Socket closed, cannot send control response");
+    }
+    else if (ret->base.direction == 0)
     {
         ret->base.direction = 0;
         len = send(skt, ret, sizeof(usbip_ret_submit) - 1024, 0);
+        if (len < 0) {
+            log_write("[USB_CB] ERROR: Failed to send control response (host-to-device)");
+        } else {
+            log_write("[USB_CB] Sent control response (host-to-device): %d bytes", len);
+        }
     }
     else
     {
         ret->base.direction = 0;
         len = send(skt, ret, sizeof(usbip_ret_submit) - 1024 + transfer->actual_num_bytes - 8, 0);
+        if (len < 0) {
+            log_write("[USB_CB] ERROR: Failed to send control response (device-to-host)");
+        } else {
+            log_write("[USB_CB] Sent control response (device-to-host): %d bytes", len);
+        }
     }
     ESP_LOGI(TAG, "Submitted ret_submit header for transfer_ctrl_submit %d", len);
     ESP_LOGI(TAG, "--------------------------");
+    
+    // Free allocated memory
     usb_host_transfer_free(transfer);
+    free(ret);  // CRITICAL: Free the malloc'd ret_submit structure
+    log_write("[USB_CB] Freed ret_submit and transfer structures");
 }
 
 static void transfer_cb(usb_transfer_t *transfer)
 {
+    uint8_t ep = transfer->bEndpointAddress & 0x7F;  // Extract endpoint number
+    log_write("[USB_CB] Transfer callback: status=%d, bytes=%d, EP=0x%02x", 
+              transfer->status, transfer->actual_num_bytes, transfer->bEndpointAddress);
+    
+    // Clear pending flag for this endpoint
+    if (ep == 1) {
+        ep1_transfer_pending = false;
+        log_write("[USB_CB] EP1 transfer complete, clearing pending flag");
+    }
+    if (ep == 2) {
+        ep2_transfer_pending = false;
+        log_write("[USB_CB] EP2 transfer complete, clearing pending flag");
+    }
+    
     ESP_LOGI(TAG, "--------------------------");
     ESP_LOGI(TAG, "Transfer status %d, actual number of bytes transferred %d", transfer->status, transfer->actual_num_bytes);
     usbip_ret_submit *ret = (usbip_ret_submit *)transfer->context;
     int len = 0;
-    if (ret->base.direction != 0)
+    
+    // Check if socket is still valid before sending
+    if (skt < 0) {
+        log_write("[USB_CB] Socket closed, cannot send transfer response");
+    }
+    else if (ret->base.direction != 0)
     {
         memcpy(&ret->transfer_buffer[0], transfer->data_buffer, ntohl(ret->actual_length));
         ret->base.direction = 0;
@@ -206,21 +330,43 @@ static void transfer_cb(usb_transfer_t *transfer)
         // usb_host_endpoint_flush(transfer->device_handle, transfer->bEndpointAddress);
         // usb_host_endpoint_clear(transfer->device_handle, transfer->bEndpointAddress);
         len = send(skt, ret, sizeof(usbip_ret_submit) - 1024 + ntohl(ret->actual_length), 0);
+        if (len < 0) {
+            log_write("[USB_CB] ERROR: Failed to send transfer response (device-to-host)");
+        } else {
+            log_write("[USB_CB] Sent transfer response (device-to-host): %d bytes", len);
+        }
     }
     else
     {
         ret->base.direction = 0;
         len = send(skt, ret, sizeof(usbip_ret_submit) - 1024, 0);
+        if (len < 0) {
+            log_write("[USB_CB] ERROR: Failed to send transfer response (host-to-device)");
+        } else {
+            log_write("[USB_CB] Sent transfer response (host-to-device): %d bytes", len);
+        }
     }
     ESP_LOGI(TAG, "Submitted ret_submit header for transfer_submit %d", len);
     ESP_LOGI(TAG, "--------------------------");
+    
+    // Free allocated memory
     usb_host_transfer_free(transfer);
+    free(ret);  // CRITICAL: Free the malloc'd ret_submit structure
+    log_write("[USB_CB] Freed ret_submit and transfer structures");
 }
 
 static void _usb_ip_event_handler_2(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
+    log_write("[USB_XFER] Processing USB transfer request");
     submit *recv_submit = (submit *)event_data;
+    
+    log_write("[USB_XFER] Allocating ret_submit structure");
     usbip_ret_submit *ret_submit = (usbip_ret_submit *)malloc(sizeof(usbip_ret_submit));
+    if (ret_submit == NULL) {
+        log_write("[USB_XFER] ERROR: Failed to allocate ret_submit");
+        return;
+    }
+    
     ret_submit->base.command = htonl(USBIP_RET_SUBMIT);
     ret_submit->base.seqnum = recv_submit->header.seqnum; // Add Seqnum
     ret_submit->base.devid = htonl(0x00000000);
@@ -236,8 +382,16 @@ static void _usb_ip_event_handler_2(void *event_handler_arg, esp_event_base_t ev
     memset(ret_submit->padding, 0, sizeof(ret_submit->padding));
 
     skt = recv_submit->sock;
+    log_write("[USB_XFER] Allocating USB transfer buffer (1000 bytes)");
     usb_transfer_t *transfer = NULL;
     esp_err_t err = usb_host_transfer_alloc(1000, 0, &transfer);
+    
+    if (err != ESP_OK || transfer == NULL) {
+        log_write("[USB_XFER] ERROR: Failed to allocate transfer: %s", esp_err_to_name(err));
+        free(ret_submit);
+        return;
+    }
+    log_write("[USB_XFER] Transfer buffer allocated successfully");
 
     ESP_LOGI(TAG, "--------------------------");
     printf("Seqnum: %ld\n", ntohl(ret_submit->base.seqnum));
@@ -249,8 +403,14 @@ static void _usb_ip_event_handler_2(void *event_handler_arg, esp_event_base_t ev
     transfer->flags = ntohl(recv_submit->cmd_submit.transfer_flags);
 
     transfer->device_handle = driver_obj.dev_hdl;
-    if (recv_submit->header.ep == 0)
+    
+    uint32_t ep = ntohl(recv_submit->header.ep);
+    log_write("[USB_XFER] EP=%u, direction=%u, length=%u", 
+              ep, ntohl(recv_submit->header.direction), ntohl(recv_submit->cmd_submit.transfer_buffer_length));
+    
+    if (ep == 0)
     {
+        log_write("[USB_XFER] Control transfer on EP0");
         memcpy(transfer->data_buffer, (void *)&recv_submit->cmd_submit.setup, 8);
         printf(" %x,", *transfer->data_buffer);
         printf(" %x,", *(transfer->data_buffer + 1));
@@ -261,15 +421,34 @@ static void _usb_ip_event_handler_2(void *event_handler_arg, esp_event_base_t ev
         printf(" %x,", *(transfer->data_buffer + 6));
         printf(" %x\n", *(transfer->data_buffer + 7));
         transfer->callback = transfer_cb_ctrl;
-        transfer->bEndpointAddress = (ntohl(recv_submit->header.ep) | (ntohl(recv_submit->header.direction) << 7));
+        transfer->bEndpointAddress = (ep | (ntohl(recv_submit->header.direction) << 7));
         transfer->num_bytes = ntohl(recv_submit->cmd_submit.transfer_buffer_length) + sizeof(usb_setup_packet_t);
+        log_write("[USB_XFER] Submitting control transfer, %d bytes", transfer->num_bytes);
         err = usb_host_transfer_submit_control(driver_obj.client_hdl, transfer);
+        log_write("[USB_XFER] Control transfer result: %s", esp_err_to_name(err));
         ESP_LOGI("Control Transfer Submit", "Error Value %x", err);
     }
     else
     {
+        log_write("[USB_XFER] Interrupt/bulk transfer on EP%u", ep);
+        
+        // Check if there's already a pending transfer on this endpoint
+        if (ep == 1 && ep1_transfer_pending) {
+            log_write("[USB_XFER] WARNING: EP1 transfer already pending, skipping");
+            usb_host_transfer_free(transfer);
+            free(ret_submit);
+            return;
+        }
+        if (ep == 2 && ep2_transfer_pending) {
+            log_write("[USB_XFER] WARNING: EP2 transfer already pending, skipping");
+            usb_host_transfer_free(transfer);
+            free(ret_submit);
+            return;
+        }
+        
         transfer->callback = transfer_cb;
-        transfer->bEndpointAddress = (ntohl(recv_submit->header.ep) | (ntohl(recv_submit->header.direction) << 7)); // ep->bEndpointAddress;
+        transfer->bEndpointAddress = (ep | (ntohl(recv_submit->header.direction) << 7)); // ep->bEndpointAddress;
+        log_write("[USB_XFER] Endpoint address: 0x%02x", transfer->bEndpointAddress);
         ESP_LOGI("Transfer Submit", "Endpoint: %d", transfer->bEndpointAddress);
         if (ntohl(recv_submit->header.direction) != 0)
         {
@@ -285,10 +464,20 @@ static void _usb_ip_event_handler_2(void *event_handler_arg, esp_event_base_t ev
         {
             ret_submit->start_frame = recv_submit->cmd_submit.start_frame;
         }
+        log_write("[USB_XFER] Submitting transfer, %d bytes", transfer->num_bytes);
         err = usb_host_transfer_submit(transfer);
+        log_write("[USB_XFER] Transfer result: %s", esp_err_to_name(err));
+        
+        if (err == ESP_OK) {
+            // Mark endpoint as having pending transfer
+            if (ep == 1) ep1_transfer_pending = true;
+            if (ep == 2) ep2_transfer_pending = true;
+        }
+        
         ESP_LOGI("Transfer Submit", "Error Value %x", err);
     }
     ESP_LOGI(TAG, "--------------------------");
+    log_write("[USB_XFER] Transfer processing complete, free heap: %d", esp_get_free_heap_size());
 }
 
 void init_unlink(uint32_t seqnum)
@@ -301,13 +490,16 @@ void usb_class_driver_task(void *arg)
     SemaphoreHandle_t signaling_sem = (SemaphoreHandle_t)arg;
 
     /* Stores all the information with regards to the USB */
+    log_write("[USB] USB class driver task started");
 
     while (1)
     {
         memset(&driver_obj, 0, sizeof(class_driver_t));
 
         // Wait until daemon task has installed USB Host Library
+        log_write("[USB] Waiting for USB Host Library to be installed...");
         xSemaphoreTake(signaling_sem, portMAX_DELAY);
+        log_write("[USB] USB Host Library ready, registering client");
 
         ESP_LOGI(TAG, "Registering Client");
         usb_host_client_config_t client_config = {
@@ -331,6 +523,7 @@ void usb_class_driver_task(void *arg)
 
         esp_event_handler_register_with(loop_handle2, USBIP_EVENT_BASE, USBIP_CMD_SUBMIT, _usb_ip_event_handler_2, NULL);
 
+        log_write("[USB] USB client ready, waiting for device events...");
         while (1)
         {
             if (driver_obj.actions == 0)
@@ -339,6 +532,7 @@ void usb_class_driver_task(void *arg)
             }
             else
             {
+                log_write("[USB] Processing device actions: 0x%02x", driver_obj.actions);
                 if (driver_obj.actions & ACTION_OPEN_DEV)
                 {
                     action_open_dev(&driver_obj);
@@ -359,20 +553,28 @@ void usb_class_driver_task(void *arg)
                 {
                     action_get_str_desc(&driver_obj);
                 }
+                
+                log_write("[USB] Actions after processing: 0x%02x", driver_obj.actions);
+                
                 if (driver_obj.actions & ACTION_CLOSE_DEV)
                 {
+                    log_write("[USB] Closing device");
                     aciton_close_dev(&driver_obj);
                 }
                 if (driver_obj.actions & ACTION_EXIT)
                 {
+                    log_write("[USB] Exit action requested");
                     /* TODO : Unbind the tcp socket and close the socket to prevent any error on client pc */
                     /* TODO : Delete the TCP SERVER TASK and free up the resource */
                     device_busy = false;
                     break;
                 }
 
-                /* Starting the TCP server on Device Detection */
-                xTaskCreatePinnedToCore(tcp_server_start, "TCP Server Start", 4096, NULL, 4, tcp_server_task, 1);
+                /* Starting the TCP server on Device Detection - ONLY IF NOT ALREADY RUNNING */
+                // NOTE: TCP server is now started in main.c, so we don't need to start it here
+                // This was causing crashes because it tried to create duplicate tasks
+                log_write("[USB] Device enumeration done, device is ready for USB/IP connections");
+                // xTaskCreatePinnedToCore(tcp_server_start, "TCP Server Start", 4096, NULL, 4, tcp_server_task, 1);
                 vTaskDelay(10);
             }
         }
@@ -388,14 +590,24 @@ void usb_host_lib_daemon_task(void *arg)
 {
     SemaphoreHandle_t signaling_sem = (SemaphoreHandle_t)arg;
     /* This will keep on looking for USB Devices */
+    log_write("[USB] USB Host daemon task started");
     while (1)
     {
+        log_write("[USB] Installing USB Host Library");
         ESP_LOGI(TAG, "Installing USB Host Library");
         usb_host_config_t host_config = {
             .skip_phy_setup = false,
             .intr_flags = ESP_INTR_FLAG_LEVEL1,
         };
-        ESP_ERROR_CHECK(usb_host_install(&host_config));
+        esp_err_t err = usb_host_install(&host_config);
+        if (err != ESP_OK) {
+            log_write("[USB] ERROR: Failed to install USB Host Library: %s", esp_err_to_name(err));
+            ESP_LOGE(TAG, "Failed to install USB Host: %s", esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        log_write("[USB] USB Host Library installed successfully");
+        log_write("[USB] USB PHY initialized on GPIO19 (D-) and GPIO20 (D+)");
 
         // Signal to the class driver task that the host library is installed
         xSemaphoreGive(signaling_sem);
@@ -404,17 +616,25 @@ void usb_host_lib_daemon_task(void *arg)
         bool has_clients = true;
         bool has_devices = true;
 
+        log_write("[USB] Entering USB host event loop, waiting for devices...");
         /* This loop will continue till the USB Device is connected */
         while (has_clients || has_devices)
         {
             uint32_t event_flags;
             ESP_ERROR_CHECK(usb_host_lib_handle_events(portMAX_DELAY, &event_flags));
+            
+            if (event_flags != 0) {
+                log_write("[USB] USB host event: flags=0x%08x", event_flags);
+            }
+            
             if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS)
             {
+                log_write("[USB] No more USB clients");
                 has_clients = false;
             }
             if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE)
             {
+                log_write("[USB] All USB devices freed");
                 has_devices = false;
             }
         }

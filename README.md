@@ -47,14 +47,29 @@ git clone git@github.com:gautam-dev-maker/esp32_usb_repeater.git
 <!-- USAGE EXAMPLES -->
 ## Server side setup.
 ### Configuration
+
+#### Configure WiFi Credentials
 ```
+cd firmware
 idf.py menuconfig
 ```
-* `Example configuration`
-  * Enter ssid and password.
-  
+* Navigate to: `USB Repeater Configuration` → `WiFi Configuration`
+  * Set **WiFi SSID** to your network name
+  * Set **WiFi Password** to your network password
+  * (Optional) Adjust **Maximum WiFi Connection Retry**
+
+For detailed WiFi configuration instructions, see [WIFI_CONFIGURATION.md](WIFI_CONFIGURATION.md)
+
+#### Optional: Configure Feature Flags
+* Navigate to: `USB Repeater Configuration`
+  * Toggle **Enable Log Handler** (stores logs in memory)
+  * Toggle **Enable HTTP Log Server** (access logs via HTTP on port 8080)
+
+For feature flag documentation, see [FEATURE_FLAGS.md](FEATURE_FLAGS.md)
+
 ### Build
 ```
+cd firmware
 idf.py build
 ```
 ### Flash and Monitor

@@ -7,6 +7,8 @@
 
 #include "usb_handler.h"
 #include "usbip_server.h"
+#include "log_handler.h"
+#include "http_server.h"
 
 extern TaskHandle_t *tcp_server_task;
 extern TaskHandle_t *usb_daemon_task_hdl;

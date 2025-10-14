@@ -43,4 +43,8 @@ void get_usbip_ret_submit(usbip_cmd_submit *dev, usbip_header_basic *header, int
 /* Fills the usbip_ret_unlink struct with the required information */
 void init_unlink(uint32_t seqnum);
 
+/* Endpoint transfer pending flags (for preventing memory exhaustion) */
+extern bool ep1_transfer_pending;
+extern bool ep2_transfer_pending;
+
 #endif

@@ -96,3 +96,13 @@ _deps
 !.vscode/launch.json
 !.vscode/extensions.json
 *.code-workspace
+
+### ESP-IDF ###
+# Build outputs
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/dependencies.lock
+
+# Note: sdkconfig contains WiFi credentials!
+# Use sdkconfig.defaults for shared configuration (without secrets)

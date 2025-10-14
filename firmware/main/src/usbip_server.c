@@ -1,4 +1,5 @@
 #include "usbip_server.h"
+#include "log_handler.h"
 
 #define TAG "USB/IP SERVER"
 
@@ -15,6 +16,35 @@ static void _usb_ip_event_handler_1(void *event_handler_arg, esp_event_base_t ev
     {
     case OP_REQ_DEVLIST:
     {
+        log_write("[USBIP] Received OP_REQ_DEVLIST request");
+        
+        // Check if USB device is available
+        const usb_device_desc_t *dev_desc_ptr = get_dev_desc();
+        const usb_config_desc_t *config_desc_ptr = get_config_desc();
+        usb_device_info_t *dev_info_ptr = get_dev_info();
+        
+        if (!dev_desc_ptr || !config_desc_ptr || !dev_info_ptr) {
+            // No device connected, send empty device list
+            log_write("[USBIP] No USB device connected, sending empty device list");
+            
+            struct {
+                uint16_t usbip_version;
+                uint16_t reply_code;
+                uint32_t status;
+                uint32_t no_of_device;
+            } __attribute__((packed)) empty_reply;
+            
+            empty_reply.usbip_version = htons(USBIP_VERSION);
+            empty_reply.reply_code = htons(OP_REP_DEVLIST);
+            empty_reply.status = htonl(0x00000000);
+            empty_reply.no_of_device = htonl(0x00000000);
+            
+            int sent = send(recv_data->sock, &empty_reply, sizeof(empty_reply), 0);
+            log_write("[USBIP] Sent empty device list response (%d bytes)", sent);
+            break;
+        }
+        
+        log_write("[USBIP] USB device found, preparing device list");
         op_rep_devlist dev;
 
         dev.usbip_version = htons(USBIP_VERSION);
@@ -33,30 +63,31 @@ static void _usb_ip_event_handler_1(void *event_handler_arg, esp_event_base_t ev
         dev.devnum = htonl(2);
 
         /* TO-DO: Verify fields */
-        dev.speed = htonl(get_dev_info()->speed + 1); // currently sendng 1 usb low speed wireless 0x00000005 dev_info.speed
-        dev.id_vendor = htons(get_dev_desc()->idVendor);
-        dev.id_product = htons(get_dev_desc()->idProduct);
-        dev.bcd_device = htons(get_dev_desc()->bcdDevice);
+        dev.speed = htonl(dev_info_ptr->speed + 1); // currently sendng 1 usb low speed wireless 0x00000005 dev_info.speed
+        dev.id_vendor = htons(dev_desc_ptr->idVendor);
+        dev.id_product = htons(dev_desc_ptr->idProduct);
+        dev.bcd_device = htons(dev_desc_ptr->bcdDevice);
 
-        dev.b_device_class = get_dev_desc()->bDeviceClass;
-        dev.b_device_sub_class = get_dev_desc()->bDeviceSubClass;
-        dev.b_device_protocol = get_dev_desc()->bDeviceProtocol;
+        dev.b_device_class = dev_desc_ptr->bDeviceClass;
+        dev.b_device_sub_class = dev_desc_ptr->bDeviceSubClass;
+        dev.b_device_protocol = dev_desc_ptr->bDeviceProtocol;
 
-        dev.b_configuration_value = get_config_desc()->bConfigurationValue;
-        dev.b_num_configurations = get_dev_desc()->bNumConfigurations;
-        dev.b_num_interfaces = get_config_desc()->bNumInterfaces;
+        dev.b_configuration_value = config_desc_ptr->bConfigurationValue;
+        dev.b_num_configurations = dev_desc_ptr->bNumConfigurations;
+        dev.b_num_interfaces = config_desc_ptr->bNumInterfaces;
 
         int offset = 0;
-        for (size_t n = 0; n < get_config_desc()->bNumInterfaces; n++) // usb_net_recv failed usbip_usb_intf[1]
+        for (size_t n = 0; n < config_desc_ptr->bNumInterfaces; n++) // usb_net_recv failed usbip_usb_intf[1]
         {
-            const usb_intf_desc_t *intf = usb_parse_interface_descriptor(get_config_desc(), n, 0, &offset);
+            const usb_intf_desc_t *intf = usb_parse_interface_descriptor(config_desc_ptr, n, 0, &offset);
             dev.intfs[n].bInterfaceClass = intf->bInterfaceClass;
             dev.intfs[n].bInterfaceSubClass = intf->bInterfaceSubClass;
             dev.intfs[n].bInterfaceProtocol = intf->bInterfaceProtocol;
             dev.intfs[n].padding = 0;
         }
 
-        send(recv_data->sock, &dev, sizeof(op_rep_devlist), MSG_DONTWAIT);
+        int sent = send(recv_data->sock, &dev, sizeof(op_rep_devlist), 0);
+        log_write("[USBIP] Sent device list with 1 device (%d bytes)", sent);
         break;
     }
     case OP_REQ_IMPORT:
@@ -69,6 +100,7 @@ static void _usb_ip_event_handler_1(void *event_handler_arg, esp_event_base_t ev
         if (!strcmp(BUS_ID, dev_import.bus_id))
         {
             ESP_LOGI(TAG, "BUS-ID matches for requested import device");
+            log_write("[USBIP] BUS-ID matches for requested import device: %s", dev_import.bus_id);
 
             rep_import.usbip_version = htons(USBIP_VERSION);
             rep_import.reply_code = htons(OP_REP_IMPORT);
@@ -103,20 +135,24 @@ static void _usb_ip_event_handler_1(void *event_handler_arg, esp_event_base_t ev
             rep_import.reply_code = htons(OP_REP_IMPORT);
             rep_import.status = htonl(0x00000001);
             ESP_LOGE(TAG, "Received different BUS ID");
+            log_write("[USBIP] ERROR: Received different BUS ID: %s (expected: %s)", dev_import.bus_id, BUS_ID);
         }
 
         int len = send(recv_data->sock, &rep_import, sizeof(rep_import), MSG_DONTWAIT);
         if (len < 0)
         {
             ESP_LOGE(TAG, "Error occurred during receiving");
+            log_write("[USBIP] ERROR: Failed to send import response");
         }
         else if (len == 0)
         {
             ESP_LOGW(TAG, "Connection closed");
+            log_write("[USBIP] WARNING: Connection closed during import");
         }
         else
         {
             device_busy = true;
+            log_write("[USBIP] Device imported successfully, device is now busy");
         }
         break;
     }
@@ -145,6 +181,7 @@ esp_err_t usbip_server_init()
     xTaskCreatePinnedToCore(usb_class_driver_task, "class", 4096, (void *)signaling_sem, 3, usb_class_driver_task_hdl, 0);
 
     ESP_LOGI(TAG, "Initialised the USB/IP server successfully");
+    log_write("[USBIP] USB/IP server initialized successfully");
     return ESP_OK;
 }
 
