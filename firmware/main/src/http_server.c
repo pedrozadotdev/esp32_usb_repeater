@@ -3,6 +3,7 @@
 #include <esp_http_server.h>
 #include "esp_log.h"
 #include <string.h>
+#include <esp_system.h>
 
 static const char *TAG = "HTTP_SERVER";
 static httpd_handle_t server = NULL;
@@ -61,6 +62,22 @@ static esp_err_t clear_logs_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* HTTP GET handler for /restart endpoint */
+static esp_err_t restart_handler(httpd_req_t *req)
+{
+    log_write("[HTTP] Restart request received, rebooting in 1 second...");
+    
+    const char *resp = "System restarting...\n";
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, resp, strlen(resp));
+    
+    // Schedule restart after a short delay to allow response to be sent
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+    
+    return ESP_OK;
+}
+
 /* URI handlers */
 static const httpd_uri_t root_uri = {
     .uri       = "/",
@@ -80,6 +97,13 @@ static const httpd_uri_t clear_uri = {
     .uri       = "/clear",
     .method    = HTTP_GET,
     .handler   = clear_logs_handler,
+    .user_ctx  = NULL
+};
+
+static const httpd_uri_t restart_uri = {
+    .uri       = "/restart",
+    .method    = HTTP_GET,
+    .handler   = restart_handler,
     .user_ctx  = NULL
 };
 
@@ -107,6 +131,7 @@ esp_err_t http_server_init(void)
         httpd_register_uri_handler(server, &root_uri);
         httpd_register_uri_handler(server, &logs_uri);
         httpd_register_uri_handler(server, &clear_uri);
+        httpd_register_uri_handler(server, &restart_uri);
         
         ESP_LOGI(TAG, "HTTP server started successfully");
         log_write("[HTTP] HTTP server started on port 8080");
