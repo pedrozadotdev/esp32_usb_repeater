@@ -4,15 +4,31 @@
 #include "esp_system.h"
 #include <errno.h>
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #define TAG "TCP_CONNECT"
 
 /* TODO: Make the variable "device_busy" false if the usb is unbound */
 bool device_busy = false;
 static int sock;
+static SemaphoreHandle_t sock_mutex = NULL;
 static submit recv_submit;
 // static ssize_t size;
 // static char rx_buffer[128];
+
+// Thread-safe socket send function
+int tcp_send_locked(int socket, const void *data, size_t length, int flags)
+{
+    int result = -1;
+    if (sock_mutex != NULL && xSemaphoreTake(sock_mutex, portMAX_DELAY) == pdTRUE) {
+        result = send(socket, data, length, flags);
+        xSemaphoreGive(sock_mutex);
+    } else {
+        log_write("[TCP] ERROR: Failed to acquire socket mutex");
+    }
+    return result;
+}
 
 esp_err_t tcp_server_init(void)
 {
@@ -93,19 +109,24 @@ static void do_recv()
                     if (err != ESP_OK) {
                         log_write("[TCP] ERROR: Failed to post event: %s", esp_err_to_name(err));
                     } else {
-                        log_write("[TCP] Event posted successfully, waiting for handler to complete...");
+                        log_write("[TCP] Event posted successfully");
                     }
                     
-                    // Give event handler time to process and potentially set device_busy
-                    vTaskDelay(pdMS_TO_TICKS(100)); // Increased to 100ms
-                    
-                    // If device was imported (device_busy set by event handler), skip to busy loop
-                    if (device_busy) {
-                        log_write("[TCP] Device became busy after import, switching to URB mode");
-                        continue;
+                    // For OP_REQ_IMPORT (0x8003), wait for device_busy to be set before continuing
+                    // This ensures the import response is fully sent before we start waiting for URBs
+                    if (ntohs(dev_recv.command_code) == 0x8003) {
+                        log_write("[TCP] Waiting for import to complete and device_busy to be set...");
+                        int wait_count = 0;
+                        while (!device_busy && wait_count < 100) {  // Wait up to 1 second
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                            wait_count++;
+                        }
+                        if (device_busy) {
+                            log_write("[TCP] Import complete, device_busy set after %d ms", wait_count * 10);
+                        } else {
+                            log_write("[TCP] WARNING: device_busy not set after 1 second wait!");
+                        }
                     }
-                    
-                    log_write("[TCP] Event handler completed, device_busy=%d, continuing to wait for next command", device_busy);
                 }
                 else
                 {
@@ -117,11 +138,30 @@ static void do_recv()
         if (device_busy)
         {
             log_write("[TCP] Device busy mode - handling URB commands");
+            log_write("[TCP] Socket descriptor: %d", sock);
+            
+            /* Check socket state */
+            int error = 0;
+            socklen_t errlen = sizeof(error);
+            int ret = getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &errlen);
+            log_write("[TCP] Socket state: getsockopt(SO_ERROR) returned %d, error=%d (%s)", 
+                     ret, error, error ? strerror(error) : "no error");
+            
+            /* Check if there's any pending data on the socket */
+            int pending = 0;
+            ret = ioctl(sock, FIONREAD, &pending);
+            if (ret < 0) {
+                log_write("[TCP] WARNING: ioctl(FIONREAD) failed, errno=%d (%s)", errno, strerror(errno));
+            } else {
+                log_write("[TCP] Pending bytes in socket buffer: %d", pending);
+            }
+            
             /* TODO : Start dealing with URB command codes */
             usbip_header_basic header;
             len = 0;
             while (1)
             {
+                log_write("[TCP] Waiting for URB header (%d bytes)...", sizeof(usbip_header_basic));
                 len = recv(sock, &header, sizeof(usbip_header_basic), 0);
 
                 if (len < 0) {
@@ -133,10 +173,10 @@ static void do_recv()
                     log_write("[TCP] ERROR: recv failed in URB loop, errno %d (%s)", errno, strerror(errno));
                     break;
                 } else if (len == 0) {
-                    log_write("[TCP] Connection closed in URB loop - DETACH REQUEST DETECTED!");
-                    log_write("[TCP] REBOOTING ESP32 NOW...");
-                    vTaskDelay(pdMS_TO_TICKS(100)); // Brief delay for log flush
-                    esp_restart(); // Force immediate reboot
+                    log_write("[TCP] Connection closed in URB loop - client detached");
+                    log_write("[TCP] Cleaning up and resetting device_busy flag...");
+                    device_busy = false;
+                    break; // Exit URB loop, close socket, wait for new connection
                 } else if (len > 0)
                 {
                     uint32_t cmd = ntohl(header.command);
@@ -146,33 +186,60 @@ static void do_recv()
                     {
                     case USBIP_CMD_SUBMIT:
                     {
-                        log_write("[TCP] USBIP_CMD_SUBMIT received");
-                        /* TODO: REPLY with USBIP_RET_SUBMIT */
+                        log_write("[TCP] USBIP_CMD_SUBMIT received, reading command data...");
                         usbip_cmd_submit cmd_submit;
-                        len += recv(sock, &cmd_submit, sizeof(usbip_cmd_submit) - 1024, MSG_DONTWAIT);
-                        if (ntohl(header.direction) == 0) {
-                            log_write("[TCP] Host-to-device transfer, length=%u", ntohl(cmd_submit.transfer_buffer_length));
-                            len += recv(sock, &cmd_submit.transfer_buffer[0], ntohl(cmd_submit.transfer_buffer_length), MSG_DONTWAIT);
-                        } else {
-                            log_write("[TCP] Device-to-host transfer, length=%u", ntohl(cmd_submit.transfer_buffer_length));
+                        
+                        // Read cmd_submit header (without transfer_buffer)
+                        int cmd_header_size = sizeof(usbip_cmd_submit) - 1024;
+                        int bytes_read = recv(sock, &cmd_submit, cmd_header_size, 0);
+                        if (bytes_read != cmd_header_size) {
+                            log_write("[TCP] ERROR: Failed to read cmd_submit header, got %d bytes, expected %d", 
+                                     bytes_read, cmd_header_size);
+                            break;
                         }
+                        log_write("[TCP] Read cmd_submit header (%d bytes)", bytes_read);
+                        
+                        uint32_t transfer_len = ntohl(cmd_submit.transfer_buffer_length);
+                        log_write("[TCP] Transfer length=%u, direction=%u", transfer_len, ntohl(header.direction));
+                        
+                        // For host-to-device (OUT), read the transfer data
+                        if (ntohl(header.direction) == 0 && transfer_len > 0) {
+                            if (transfer_len > 1024) {
+                                log_write("[TCP] ERROR: Transfer length %u exceeds buffer size 1024", transfer_len);
+                                break;
+                            }
+                            log_write("[TCP] Reading %u bytes of transfer data...", transfer_len);
+                            bytes_read = recv(sock, &cmd_submit.transfer_buffer[0], transfer_len, 0);
+                            if (bytes_read != transfer_len) {
+                                log_write("[TCP] ERROR: Failed to read transfer data, got %d bytes, expected %u", 
+                                         bytes_read, transfer_len);
+                                break;
+                            }
+                            log_write("[TCP] Transfer data read successfully (%d bytes)", bytes_read);
+                        }
+                        
+                        // Populate submit structure
                         recv_submit.header = header;
                         recv_submit.cmd_submit = cmd_submit;
                         recv_submit.sock = sock;
-                        if (len > 20) {
-                            esp_err_t err = esp_event_post_to(loop_handle2, USBIP_EVENT_BASE, USBIP_CMD_SUBMIT, (void *)&recv_submit, sizeof(submit), 10);
-                            if (err != ESP_OK) {
-                                log_write("[TCP] ERROR: Failed to post SUBMIT event: %s", esp_err_to_name(err));
-                            }
+                        
+                        log_write("[TCP] Posting SUBMIT event to USB handler...");
+                        esp_err_t err = esp_event_post_to(loop_handle2, USBIP_EVENT_BASE, USBIP_CMD_SUBMIT, 
+                                                          (void *)&recv_submit, sizeof(submit), portMAX_DELAY);
+                        if (err != ESP_OK) {
+                            log_write("[TCP] ERROR: Failed to post SUBMIT event: %s", esp_err_to_name(err));
+                        } else {
+                            log_write("[TCP] SUBMIT event posted successfully");
                         }
-                        len = 0;
                         break;
                     }
 
                     case USBIP_CMD_UNLINK:
                     {
+                        log_write("[TCP] USBIP_CMD_UNLINK received");
                         usbip_cmd_unlink cmd_unlink;
                         len = recv(sock, &cmd_unlink, sizeof(usbip_cmd_unlink), 0);
+                        log_write("[TCP] Unlink request for seqnum=%u", ntohl(cmd_unlink.unlink_seqnum));
                         init_unlink(ntohl(cmd_unlink.unlink_seqnum));
 
                         /* TODO: REPLY with RET_UNLINK after error check*/
@@ -186,12 +253,14 @@ static void do_recv()
                         ret_unlink.status = htonl(0);
 
                         memset(ret_unlink.padding, 0, 24);
-                        len = send(sock, &ret_unlink, sizeof(usbip_ret_unlink), 0);
+                        len = tcp_send_locked(sock, &ret_unlink, sizeof(usbip_ret_unlink), 0);
+                        log_write("[TCP] Sent USBIP_RET_UNLINK response: %d bytes", len);
                         ESP_LOGI(TAG, "Submitted ret_unlink %u", len);
-                        // ESP_LOGI(TAG, "--------------------------");/
+                        len = 0;
                         break;
                     }
                     default:
+                        log_write("[TCP] WARNING: Unknown URB command: 0x%08x", cmd);
                         printf("SUCCESS\n");
                         break;
                     }
@@ -222,6 +291,16 @@ static void do_recv()
 void tcp_server_start(void *pvParameters)
 {
     ESP_LOGI(TAG, "TCP server task started");
+    
+    // Create mutex for socket operations
+    sock_mutex = xSemaphoreCreateMutex();
+    if (sock_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create socket mutex");
+        log_write("[TCP] ERROR: Failed to create socket mutex");
+        vTaskDelete(NULL);
+        return;
+    }
+    log_write("[TCP] Socket mutex created successfully");
     
     int addr_family = AF_INET;
     int ip_protocol = 0;

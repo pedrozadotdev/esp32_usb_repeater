@@ -9,7 +9,8 @@
 #include "esp_log.h"
 #include "sdkconfig.h"
 
-#define LOG_BUFFER_SIZE (4 * 1024)  // 4KB circular buffer in RTC memory (survives reboots)
+#define LOG_FILE_PATH "/spiffs/system.log"  // Log file on SPIFFS partition
+#define LOG_MAX_SIZE (128 * 1024)  // 128KB max log file size before rotation
 
 #ifdef CONFIG_ENABLE_LOG_HANDLER
 

@@ -24,6 +24,9 @@ set(PRIV_REQUIRED_COMPONENTS esp_wifi lwip nvs_flash esp_event protocol_examples
 # The actual compilation of http_server.c is still controlled by CONFIG_ENABLE_HTTP_SERVER
 list(APPEND PRIV_REQUIRED_COMPONENTS esp_http_server)
 
+# Add spiffs for file-based logging
+list(APPEND PRIV_REQUIRED_COMPONENTS spiffs)
+
 # Register the component and list all its private dependencies
 idf_component_register(SRCS ${SRCS}
                        INCLUDE_DIRS ${INCLUDE_DIRS}

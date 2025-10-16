@@ -30,4 +30,8 @@ ESP_EVENT_DECLARE_BASE(USBIP_EVENT_BASE);
 
 esp_err_t tcp_server_init(void);
 void tcp_server_start(void *pvParameters);
+
+// Thread-safe socket send function
+int tcp_send_locked(int socket, const void *data, size_t length, int flags);
+
 #endif

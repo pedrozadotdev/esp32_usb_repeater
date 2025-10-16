@@ -13,14 +13,24 @@ static esp_err_t logs_get_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/plain");
     
     size_t log_size = log_get_size();
-    const char *log_ptr = log_get_buffer_ptr();
     
-    if (log_size == 0 || log_ptr == NULL) {
+    if (log_size == 0) {
         const char *empty = "(No logs)\n";
         return httpd_resp_send(req, empty, strlen(empty));
     }
     
-    return httpd_resp_send(req, log_ptr, log_size);
+    // Allocate temporary buffer for log data
+    char *log_buffer = malloc(log_size + 1);
+    if (log_buffer == NULL) {
+        const char *error = "Error: Failed to allocate memory for logs\n";
+        return httpd_resp_send(req, error, strlen(error));
+    }
+    
+    size_t bytes_read = log_get_buffer(log_buffer, log_size + 1);
+    esp_err_t ret = httpd_resp_send(req, log_buffer, bytes_read);
+    
+    free(log_buffer);
+    return ret;
 }
 
 /* HTTP GET handler for root endpoint */

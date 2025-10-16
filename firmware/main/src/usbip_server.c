@@ -151,7 +151,7 @@ static void _usb_ip_event_handler_1(void *event_handler_arg, esp_event_base_t ev
             rep_import.status = htonl(0x00000000);
 
             memset(rep_import.path, 0, sizeof(rep_import.path));
-            strcpy(rep_import.path, "/sys/rep_importices/pci0000:00/0000:00:1d.1/usb2/3-2");
+            strcpy(rep_import.path, "/sys/devices/pci0000:00/0000:00:1d.1/usb2/3-2");
             memset(rep_import.bus_id, 0, sizeof(rep_import.bus_id));
             strcpy(rep_import.bus_id, BUS_ID);
 
@@ -159,7 +159,7 @@ static void _usb_ip_event_handler_1(void *event_handler_arg, esp_event_base_t ev
             rep_import.busnum = htonl(3);
             rep_import.devnum = htonl(2);
 
-            rep_import.speed = get_dev_info()->speed ? htonl(2) : htonl(1);
+            rep_import.speed = htonl(get_dev_info()->speed + 1); // Match devlist: 0=low->1, 1=full->2, 2=high->3
             rep_import.id_vendor = htons(get_dev_desc()->idVendor);
             rep_import.id_product = htons(get_dev_desc()->idProduct);
             rep_import.bcd_device = htons(get_dev_desc()->bcdDevice);
@@ -182,21 +182,26 @@ static void _usb_ip_event_handler_1(void *event_handler_arg, esp_event_base_t ev
             log_write("[USBIP] ERROR: Received different BUS ID: %s (expected: %s)", dev_import.bus_id, BUS_ID);
         }
 
-        int len = send(recv_data->sock, &rep_import, sizeof(rep_import), MSG_DONTWAIT);
+        int len = tcp_send_locked(recv_data->sock, &rep_import, sizeof(rep_import), 0);
         if (len < 0)
         {
-            ESP_LOGE(TAG, "Error occurred during receiving");
-            log_write("[USBIP] ERROR: Failed to send import response");
+            ESP_LOGE(TAG, "Error occurred during sending import response");
+            log_write("[USBIP] ERROR: Failed to send import response, errno=%d", errno);
         }
         else if (len == 0)
         {
             ESP_LOGW(TAG, "Connection closed");
             log_write("[USBIP] WARNING: Connection closed during import");
         }
+        else if (len != sizeof(rep_import))
+        {
+            log_write("[USBIP] WARNING: Partial send! Expected %d bytes, sent %d bytes", sizeof(rep_import), len);
+        }
         else
         {
+            log_write("[USBIP] Import response sent successfully (%d bytes), setting device_busy", len);
             device_busy = true;
-            log_write("[USBIP] Device imported successfully, device is now busy");
+            log_write("[USBIP] Device is now busy, ready for URB commands");
         }
         break;
     }

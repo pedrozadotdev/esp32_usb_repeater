@@ -258,19 +258,45 @@ static void transfer_cb_ctrl(usb_transfer_t *transfer)
     ESP_LOGI(TAG, "--------------------------");
     ESP_LOGI(TAG, "Transfer status %d, actual number of bytes transferred %d\n", transfer->status, transfer->actual_num_bytes);
     usbip_ret_submit *ret = (usbip_ret_submit *)transfer->context;
-    ret->actual_length = htonl(transfer->actual_num_bytes - 8);
-    memcpy(&ret->transfer_buffer[0], transfer->data_buffer + 8, transfer->actual_num_bytes - 8);
+    
+    // Map ESP32 USB transfer status to USB/IP status codes
+    // 0 = success, 4 = stall, others = errors
+    int32_t usbip_status = 0;
+    if (transfer->status == USB_TRANSFER_STATUS_STALL) {
+        usbip_status = -32;  // -EPIPE in Linux
+        log_write("[USB_CB] Transfer STALLED");
+    } else if (transfer->status != USB_TRANSFER_STATUS_COMPLETED) {
+        usbip_status = -71;  // -EPROTO in Linux
+        log_write("[USB_CB] Transfer failed with status %d", transfer->status);
+    }
+    ret->status = htonl(usbip_status);
+    
+    // Calculate actual data length (excluding 8-byte setup packet)
+    // For error cases (status != 0) or when actual_num_bytes < 8, set to 0
+    int32_t data_len = 0;
+    if (transfer->status == USB_TRANSFER_STATUS_COMPLETED && transfer->actual_num_bytes >= 8) {
+        data_len = transfer->actual_num_bytes - 8;
+        memcpy(&ret->transfer_buffer[0], transfer->data_buffer + 8, data_len);
+    }
+    ret->actual_length = htonl(data_len);
 
     int len = 0;
+    
+    // Log the response header fields for debugging
+    log_write("[USB_CB] Response header: cmd=0x%08x, seqnum=%u, devid=0x%08x, dir=0x%08x, ep=0x%08x",
+             ntohl(ret->base.command), ntohl(ret->base.seqnum), ntohl(ret->base.devid),
+             ntohl(ret->base.direction), ntohl(ret->base.ep));
+    log_write("[USB_CB] Response body: status=%d, actual_len=%u",
+             (int32_t)ntohl(ret->status), ntohl(ret->actual_length));
     
     // Check if socket is still valid before sending
     if (skt < 0) {
         log_write("[USB_CB] Socket closed, cannot send control response");
     }
-    else if (ret->base.direction == 0)
+    else if (ntohl(ret->base.direction) == 0)
     {
-        ret->base.direction = 0;
-        len = send(skt, ret, sizeof(usbip_ret_submit) - 1024, 0);
+        // Host-to-device: no data in response
+        len = tcp_send_locked(skt, ret, sizeof(usbip_ret_submit) - 1024, 0);
         if (len < 0) {
             log_write("[USB_CB] ERROR: Failed to send control response (host-to-device)");
         } else {
@@ -279,10 +305,14 @@ static void transfer_cb_ctrl(usb_transfer_t *transfer)
     }
     else
     {
-        ret->base.direction = 0;
-        len = send(skt, ret, sizeof(usbip_ret_submit) - 1024 + transfer->actual_num_bytes - 8, 0);
+        // Device-to-host: include data in response
+        int send_size = sizeof(usbip_ret_submit) - 1024 + ntohl(ret->actual_length);
+        len = tcp_send_locked(skt, ret, send_size, 0);
         if (len < 0) {
-            log_write("[USB_CB] ERROR: Failed to send control response (device-to-host)");
+            log_write("[USB_CB] ERROR: Failed to send control response (device-to-host), errno=%d (%s)", 
+                     errno, strerror(errno));
+        } else if (len != send_size) {
+            log_write("[USB_CB] WARNING: Partial send! Expected %d bytes, sent %d bytes", send_size, len);
         } else {
             log_write("[USB_CB] Sent control response (device-to-host): %d bytes", len);
         }
@@ -329,7 +359,7 @@ static void transfer_cb(usb_transfer_t *transfer)
         // usb_host_endpoint_halt(transfer->device_handle, transfer->bEndpointAddress);
         // usb_host_endpoint_flush(transfer->device_handle, transfer->bEndpointAddress);
         // usb_host_endpoint_clear(transfer->device_handle, transfer->bEndpointAddress);
-        len = send(skt, ret, sizeof(usbip_ret_submit) - 1024 + ntohl(ret->actual_length), 0);
+        len = tcp_send_locked(skt, ret, sizeof(usbip_ret_submit) - 1024 + ntohl(ret->actual_length), 0);
         if (len < 0) {
             log_write("[USB_CB] ERROR: Failed to send transfer response (device-to-host)");
         } else {
@@ -339,7 +369,7 @@ static void transfer_cb(usb_transfer_t *transfer)
     else
     {
         ret->base.direction = 0;
-        len = send(skt, ret, sizeof(usbip_ret_submit) - 1024, 0);
+        len = tcp_send_locked(skt, ret, sizeof(usbip_ret_submit) - 1024, 0);
         if (len < 0) {
             log_write("[USB_CB] ERROR: Failed to send transfer response (host-to-device)");
         } else {
@@ -368,12 +398,12 @@ static void _usb_ip_event_handler_2(void *event_handler_arg, esp_event_base_t ev
     }
     
     ret_submit->base.command = htonl(USBIP_RET_SUBMIT);
-    ret_submit->base.seqnum = recv_submit->header.seqnum; // Add Seqnum
-    ret_submit->base.devid = htonl(0x00000000);
-    ret_submit->base.direction = recv_submit->header.direction;
-    ret_submit->base.ep = htonl(0x00000000);
+    ret_submit->base.seqnum = recv_submit->header.seqnum; // Preserve seqnum from request
+    ret_submit->base.devid = recv_submit->header.devid;   // Preserve devid from request
+    ret_submit->base.direction = recv_submit->header.direction; // Preserve direction from request
+    ret_submit->base.ep = recv_submit->header.ep;         // Preserve endpoint from request
 
-    ret_submit->status = htonl(0x00000000);
+    ret_submit->status = htonl(0x00000000);  // Will be updated by callback based on transfer status
     ret_submit->start_frame = htonl(0x00000000);
     ret_submit->number_of_packets = htonl(0x00000000);
     ret_submit->error_count = htonl(0x00000000);
