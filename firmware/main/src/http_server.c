@@ -1,5 +1,7 @@
 #include "http_server.h"
 #include "log_handler.h"
+#include <esp_http_server.h>
+#include "esp_log.h"
 #include <string.h>
 
 static const char *TAG = "HTTP_SERVER";

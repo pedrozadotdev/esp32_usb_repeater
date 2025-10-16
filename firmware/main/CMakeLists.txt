@@ -17,14 +17,15 @@ endif()
 # List of include directories
 set(INCLUDE_DIRS "include")
 
-# Build list of required components
-set(REQUIRED_COMPONENTS usb)
-if(CONFIG_ENABLE_HTTP_SERVER)
-    list(APPEND REQUIRED_COMPONENTS esp_http_server)
-endif()
+# Build list of private required components
+set(PRIV_REQUIRED_COMPONENTS esp_wifi lwip nvs_flash esp_event protocol_examples_common)
+
+# Always include esp_http_server in PRIV_REQUIRES to avoid dependency issues
+# The actual compilation of http_server.c is still controlled by CONFIG_ENABLE_HTTP_SERVER
+list(APPEND PRIV_REQUIRED_COMPONENTS esp_http_server)
 
 # Register the component and list all its private dependencies
 idf_component_register(SRCS ${SRCS}
                        INCLUDE_DIRS ${INCLUDE_DIRS}
-                       REQUIRES ${REQUIRED_COMPONENTS}
-                       PRIV_REQUIRES esp_wifi lwip nvs_flash esp_event protocol_examples_common)
+                       REQUIRES usb
+                       PRIV_REQUIRES ${PRIV_REQUIRED_COMPONENTS})

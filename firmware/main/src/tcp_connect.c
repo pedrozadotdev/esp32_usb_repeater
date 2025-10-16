@@ -2,7 +2,8 @@
 #include "log_handler.h"
 #include "usb_handler.h"
 #include "esp_system.h"
-// #include <errno.h>
+#include <errno.h>
+#include <string.h>
 
 #define TAG "TCP_CONNECT"
 
@@ -45,20 +46,26 @@ static void do_recv()
         if (!device_busy)
         {
             // usbip_header_common dev_recv;
+            log_write("[TCP] Waiting for USB/IP command (device not busy)...");
             len = recv(sock, &dev_recv, sizeof(usbip_header_common), 0); // Blocking call
             if (len < 0)
             {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Timeout occurred - this is normal, just continue waiting
+                    log_write("[TCP] Socket receive timeout, continuing to wait for data...");
+                    continue;
+                }
                 ESP_LOGE(TAG, "Error occurred during receiving: errno %d", errno);
-                log_write("[TCP] ERROR: recv failed, errno %d", errno);
+                log_write("[TCP] ERROR: recv failed, errno %d (%s)", errno, strerror(errno));
                 break;
             }
             else if (len == 0)
             {
                 ESP_LOGW(TAG, "Connection closed");
-                log_write("[TCP] Connection closed by client - DETACH REQUEST DETECTED!");
-                log_write("[TCP] REBOOTING ESP32 NOW...");
-                vTaskDelay(pdMS_TO_TICKS(100)); // Brief delay for log flush
-                esp_restart(); // Force immediate reboot
+                log_write("[TCP] Connection closed by client (possibly after device list query)");
+                // Don't reboot - this is normal when client just queries device list
+                // Clean up and wait for new connection
+                break; // Exit recv loop, close socket, wait for new connection
             }
             else if (len > 0)
             {
@@ -80,11 +87,25 @@ static void do_recv()
                     buffer.len = sizeof(usbip_header_common);
                     buffer.rx_buffer = (uint8_t *)&dev_recv;
                     
+                    log_write("[TCP] Posting event to handler, command=0x%04x", ntohs(dev_recv.command_code));
                     esp_err_t err = esp_event_post_to(loop_handle, USBIP_EVENT_BASE, ntohs(dev_recv.command_code), 
                                                        (void *)&buffer, sizeof(tcp_data), portMAX_DELAY);
                     if (err != ESP_OK) {
                         log_write("[TCP] ERROR: Failed to post event: %s", esp_err_to_name(err));
+                    } else {
+                        log_write("[TCP] Event posted successfully, waiting for handler to complete...");
                     }
+                    
+                    // Give event handler time to process and potentially set device_busy
+                    vTaskDelay(pdMS_TO_TICKS(100)); // Increased to 100ms
+                    
+                    // If device was imported (device_busy set by event handler), skip to busy loop
+                    if (device_busy) {
+                        log_write("[TCP] Device became busy after import, switching to URB mode");
+                        continue;
+                    }
+                    
+                    log_write("[TCP] Event handler completed, device_busy=%d, continuing to wait for next command", device_busy);
                 }
                 else
                 {
@@ -104,7 +125,12 @@ static void do_recv()
                 len = recv(sock, &header, sizeof(usbip_header_basic), 0);
 
                 if (len < 0) {
-                    log_write("[TCP] ERROR: recv failed in URB loop, errno %d", errno);
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        // Timeout occurred - this is normal, just continue waiting
+                        log_write("[TCP] URB socket receive timeout, continuing to wait...");
+                        continue;
+                    }
+                    log_write("[TCP] ERROR: recv failed in URB loop, errno %d (%s)", errno, strerror(errno));
                     break;
                 } else if (len == 0) {
                     log_write("[TCP] Connection closed in URB loop - DETACH REQUEST DETECTED!");
@@ -173,11 +199,11 @@ static void do_recv()
             }
         }
 
-        if (!device_busy)
-            break;
+        /* Continue looping - don't break here! 
+         * The loop should continue until a socket error or connection close */
     }
     
-    log_write("[TCP] Receive task ending (should not reach here - detach triggers immediate reboot)");
+    log_write("[TCP] Receive loop ended, cleaning up connection");
     
     // Mark device as not busy so no more transfers are accepted
     device_busy = false;
@@ -189,7 +215,8 @@ static void do_recv()
     close(sock);
     sock = -1;  // Invalidate socket
     
-    vTaskDelete(NULL);
+    log_write("[TCP] Socket closed, ready for new connection");
+    // Return to tcp_server_start() which will accept new connections
 }
 
 void tcp_server_start(void *pvParameters)
@@ -294,26 +321,26 @@ void tcp_server_start(void *pvParameters)
         
         setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(int));
         log_write("[TCP] TCP_KEEPCNT set");
-
-        log_write("[TCP] Creating receive task...");
-        log_write("[TCP] Free heap before task creation: %d bytes", esp_get_free_heap_size());
-        ESP_LOGI(TAG, "Creating receive task...");
         
-        // Create receive task - try unpinned with smaller stack
-        BaseType_t ret = xTaskCreate(do_recv, "tcp_recv", 6144, NULL, 10, NULL);
-        log_write("[TCP] xTaskCreate returned: %d", ret);
-        if (ret != pdPASS) {
-            ESP_LOGE(TAG, "Failed to create receive task");
-            log_write("[TCP] ERROR: Failed to create receive task");
-            close(sock);
-            continue;
-        }
+        // Set socket receive timeout to 30 seconds to prevent premature connection closure
+        struct timeval timeout;
+        timeout.tv_sec = 30;
+        timeout.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        log_write("[TCP] SO_RCVTIMEO set to 30 seconds");
         
-        log_write("[TCP] Receive task created successfully");
-        ESP_LOGI(TAG, "Receive task created successfully");
+        // Disable Nagle's algorithm for lower latency
+        int nodelay = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(int));
+        log_write("[TCP] TCP_NODELAY set");
 
-        // shutdown(sock, 0);
-        // close(sock);
+        log_write("[TCP] Handling client connection directly (not creating separate task)...");
+        
+        // Handle the connection directly instead of creating a task
+        do_recv();
+        
+        // After connection closes, clean up and wait for next connection
+        log_write("[TCP] Client disconnected, ready for new connection");
     }
 CLEAN_UP:
     close(listen_sock);

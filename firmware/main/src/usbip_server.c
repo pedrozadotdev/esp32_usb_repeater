@@ -1,5 +1,6 @@
 #include "usbip_server.h"
 #include "log_handler.h"
+#include <errno.h>
 
 #define TAG "USB/IP SERVER"
 
@@ -92,9 +93,52 @@ static void _usb_ip_event_handler_1(void *event_handler_arg, esp_event_base_t ev
     }
     case OP_REQ_IMPORT:
     {
-        /* TODO: perform error check as perfomed above after receiving */
+        /* Read the complete import request structure */
         op_req_import dev_import;
-        recv(recv_data->sock, dev_import.bus_id, sizeof(op_req_import) - recv_data->len, 0);
+        
+        /* recv_data->rx_buffer contains the first 8 bytes (version+command)
+         * We need to read the complete structure which is 40 bytes total:
+         * - 2 bytes: usbip_version (already read)
+         * - 2 bytes: command_code (already read)
+         * - 4 bytes: status (need to read)
+         * - 32 bytes: bus_id (need to read)
+         */
+        
+        /* Initialize the structure to zero */
+        memset(&dev_import, 0, sizeof(dev_import));
+        
+        /* Copy the header that was already read from rx_buffer */
+        log_write("[USBIP] recv_data->len = %d, copying from rx_buffer...", recv_data->len);
+        memcpy(&dev_import, recv_data->rx_buffer, recv_data->len);
+        
+        /* Debug: print what we received */
+        log_write("[USBIP] Header: version=0x%04x, command=0x%04x, status=0x%08x", 
+                 ntohs(dev_import.usbip_version), ntohs(dev_import.command_code), ntohl(dev_import.status));
+        
+        /* Calculate remaining bytes to read: total struct size - what we already have */
+        int remaining_bytes = sizeof(op_req_import) - recv_data->len;
+        log_write("[USBIP] Need to read %d more bytes (sizeof(op_req_import)=%d)", remaining_bytes, sizeof(op_req_import));
+        
+        /* Read the remaining bytes (the bus_id field) */
+        int bytes_read = recv(recv_data->sock, ((char*)&dev_import) + recv_data->len, remaining_bytes, 0);
+        
+        if (bytes_read < 0) {
+            log_write("[USBIP] ERROR: recv() failed with errno=%d (%s)", errno, strerror(errno));
+            break;
+        }
+        
+        if (bytes_read == 0) {
+            log_write("[USBIP] ERROR: Connection closed by peer while reading bus_id");
+            break;
+        }
+        
+        if (bytes_read != remaining_bytes) {
+            log_write("[USBIP] ERROR: Incomplete read (got %d bytes, expected %d)", bytes_read, remaining_bytes);
+            break;
+        }
+        
+        log_write("[USBIP] Successfully read %d bytes, bus_id='%s'", bytes_read, dev_import.bus_id);
+        
         op_rep_import rep_import;
 
         if (!strcmp(BUS_ID, dev_import.bus_id))
